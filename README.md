@@ -43,10 +43,9 @@ Getting started is easy. Just follow these steps:
 
 1.  **Clone the Repository**:
     ```bash
-    git clone https://github.com/your-username/autounpack.git
+    git clone https://github.com/Nurbzz188/AutoUnpack.git
     cd autounpack
     ```
-    *(Don't forget to replace `your-username` with your actual GitHub username!)*
 
 2.  **Install Dependencies**:
     The project comes with a `requirements.txt` file to make this step simple.
