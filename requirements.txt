@@ -1,4 +1,4 @@
-watchdog
-python-qbittorrent
-rich 
-qbittorrent-api 
+qbittorrent-api
+pystray
+Pillow
+pywin32 
