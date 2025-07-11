@@ -1,3 +1,4 @@
 watchdog
 python-qbittorrent
 rich 
+qbittorrent-api 
