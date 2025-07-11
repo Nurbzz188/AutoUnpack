@@ -14,14 +14,7 @@ AutoUnpack is a user-friendly desktop application that automates the entire proc
 
 - **🚀 Fully Automated**: Set it up once and let it run. AutoUnpack watches your folders and processes downloads as soon as they're complete.
 - **🔌 qBittorrent Integration**: Connects directly to the qBittorrent WebUI to check torrent progress and pause downloads before extraction, preventing file corruption.
-- **📦 Universal Unpacking**: Powered by 7-Zip, it handles all common archive types, including `.rar`, `.zip`, `.7z`, and even complex multi-part archives.
-- **🖥️ Modern GUI**: A sleek, dark-themed interface built with `tkinter` lets you control everything with ease.
-- ** MANUAL SCAN**: Process any torrents that were downloaded while the app was closed with a single click.
-- **📖 Extraction History**: A color-coded log shows your successful (✅ Green) and failed (❌ Red) extractions. You can even open the destination folder directly from the history.
-- **⚙️ Flexible Options**:
-    - Automatically delete archives after a successful extraction to keep your folders clean.
-    - Choose between creating a tidy subfolder for each download or extracting files directly into the torrent's root folder.
-- **💾 Persistent & Real-Time Settings**: Your configuration is saved in real-time and automatically loaded on launch. No need to re-enter settings.
+
 
 ---
 
@@ -66,7 +59,7 @@ Getting started is easy. Just follow these steps:
         -   **7-Zip Path**: Point the app to your `7z.exe` file (e.g., `C:\Program Files\7-Zip\7z.exe`).
     -   **Tweak Your Options**: Enable or disable features like deleting archives or creating subfolders to match your workflow.
 
-    Your settings are saved automatically, so you'll only need to do this once!
+   
 
 ---
 
