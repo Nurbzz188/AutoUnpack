@@ -1,0 +1,672 @@
+import configparser
+import logging
+import os
+import queue
+import re
+import subprocess
+import threading
+import time
+import tkinter as tk
+from collections import defaultdict
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+from qbittorrent import Client
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+from style import Style
+
+# --- Configuration ---
+CONFIG_FILE = "config.ini"
+EXTRACTION_LOG_FILE = "extractions.log"
+SUPPORTED_ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"}
+PART_REGEX = re.compile(r"(.+?)\.(part\d{1,3}|[r-z]\d{2}|\d{3})$", re.IGNORECASE)
+
+
+class Unpacker:
+    """Handles the logic for finding and extracting archives."""
+
+    def __init__(self, seven_zip_path, delete_on_success, logger, gui_queue, create_subfolder):
+        self.seven_zip_path = seven_zip_path
+        self.delete_on_success = delete_on_success
+        self.logger = logger
+        self.gui_queue = gui_queue
+        self.create_subfolder = create_subfolder
+
+    def unpack_archives(self, path):
+        """Finds and unpacks archives at the given path."""
+        all_archives = []
+        if path.is_file():
+            if path.suffix.lower() in SUPPORTED_ARCHIVE_EXTENSIONS or PART_REGEX.match(path.name):
+                all_archives.append(path)
+        elif path.is_dir():
+            for root, _, files in os.walk(path):
+                for file in files:
+                    file_path = Path(root) / file
+                    if file_path.suffix.lower() in SUPPORTED_ARCHIVE_EXTENSIONS or PART_REGEX.match(file_path.name):
+                        all_archives.append(file_path)
+
+        if not all_archives:
+            self.logger.info(f"No supported archives found in '{path}'.")
+            return
+
+        archive_sets = defaultdict(list)
+        for archive in all_archives:
+            match = PART_REGEX.match(archive.name)
+            base_name = match.group(1) if match else archive.stem
+            archive_sets[base_name].append(archive)
+
+        for base_name, file_list in archive_sets.items():
+            rar_files = [f for f in file_list if f.suffix.lower() == '.rar']
+            primary_file = rar_files[0] if rar_files else sorted(file_list)[0]
+            
+            self.logger.info(f"Found archive set '{base_name}' with {len(file_list)} parts. Starting with '{primary_file.name}'.")
+            self.extract_archive(primary_file, file_list, path.name)
+
+    def extract_archive(self, archive_path, all_parts, torrent_name):
+        base_name = torrent_name
+        
+        if self.create_subfolder:
+            output_dir = archive_path.parent / base_name
+            counter = 1
+            # Create a unique directory name if the original one exists
+            while output_dir.exists():
+                output_dir = archive_path.parent / f"{base_name} ({counter})"
+                counter += 1
+            
+            extraction_name = output_dir.name
+            # The directory is guaranteed not to exist at this point, so we create it.
+            output_dir.mkdir()
+            self.logger.info(f"Created extraction directory: '{output_dir}'")
+        else:
+            output_dir = archive_path.parent
+            extraction_name = base_name
+            self.logger.info(f"Extracting archive to root folder: '{output_dir}'")
+
+        command = [self.seven_zip_path, "x", str(archive_path), f"-o{output_dir}", "-y"]
+        try:
+            self.gui_queue.put(('status', f"Extracting: {archive_path.name}"))
+            self.gui_queue.put(('progress', 'start'))
+            self.logger.info(f"Extracting '{archive_path.name}'...")
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+            
+            self.logger.info(f"Successfully extracted '{archive_path.name}' to '{output_dir}'")
+            self._log_extraction_event('SUCCESS', extraction_name, str(output_dir))
+
+
+            if self.delete_on_success:
+                self.logger.info(f"Deleting {len(all_parts)} archive part(s)...")
+                for part in all_parts:
+                    try:
+                        os.remove(part)
+                        self.logger.info(f"Deleted '{part.name}'")
+                    except OSError as e:
+                        self.logger.error(f"Failed to delete '{part.name}': {e}")
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to extract '{archive_path.name}'.")
+            if e.stderr:
+                self.logger.error(f"7-Zip Output:\n{e.stderr}")
+            self._log_extraction_event('FAILURE', extraction_name, str(output_dir))
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred during extraction: {e}")
+            self._log_extraction_event('FAILURE', extraction_name, str(output_dir))
+        finally:
+            self.gui_queue.put(('progress', 'stop'))
+            self.gui_queue.put(('status', "Monitoring..."))
+
+    def _log_extraction_event(self, status, name, path):
+        """Logs an extraction event to the history file and GUI queue."""
+        with open(EXTRACTION_LOG_FILE, 'a') as f:
+            f.write(f"{status}:{name}:{path}\n")
+        
+        if status == 'SUCCESS':
+            self.gui_queue.put(('extraction_success', (name, path)))
+        elif status == 'FAILURE':
+            self.gui_queue.put(('extraction_failure', (name, path)))
+
+
+class QueueHandler(logging.Handler):
+    """Class to send logging records to a queue."""
+    def __init__(self, gui_queue):
+        super().__init__()
+        self.gui_queue = gui_queue
+
+    def emit(self, record):
+        self.gui_queue.put(('log', self.format(record)))
+
+
+class UnpackMonitorThread(threading.Thread):
+    """The main worker thread for monitoring and unpacking."""
+    def __init__(self, config, logger, processed_torrents, gui_queue):
+        super().__init__()
+        self.config = config
+        self.logger = logger
+        self.observer = Observer()
+        self.daemon = True
+        self._stop_event = threading.Event()
+        self.processed_torrents = processed_torrents
+        self.gui_queue = gui_queue
+
+    def run(self):
+        qbt_config = self.config["qBittorrent"]
+        qbt_url = f"http://{qbt_config.get('host')}:{qbt_config.get('port')}/"
+        qbt_client = Client(qbt_url)
+
+        try:
+            qbt_client.login(username=qbt_config.get("username"), password=qbt_config.get("password"))
+            self.logger.info("Successfully connected to qBittorrent.")
+        except Exception as e:
+            self.logger.error(f"Could not connect to qBittorrent: {e}")
+            self.gui_queue.put(('status', "Error: Connection Failed"))
+            return
+
+        folder_config = self.config["Folders"]
+        monitor_path = folder_config.get("monitor_path")
+        seven_zip_path = folder_config.get("seven_zip_path")
+        delete_on_success = self.config.getboolean("General", "delete_on_success", fallback=False)
+        create_subfolder = self.config.getboolean("General", "create_subfolder", fallback=True)
+
+        unpacker = Unpacker(seven_zip_path, delete_on_success, self.logger, self.gui_queue, create_subfolder)
+        event_handler = ArchiveEventHandler(qbt_client, self.logger, self.processed_torrents, unpacker)
+        self.observer.schedule(event_handler, monitor_path, recursive=True)
+        self.observer.start()
+
+        self.logger.info(f"Monitoring folder: {monitor_path}")
+        self.logger.info(f"Delete on success: {'Enabled' if delete_on_success else 'Disabled'}")
+        self.gui_queue.put(('status', "Monitoring..."))
+
+        while not self._stop_event.is_set():
+            time.sleep(1)
+
+        self.observer.stop()
+        self.observer.join()
+        self.logger.info("Monitoring stopped.")
+
+    def stop(self):
+        self._stop_event.set()
+
+
+class ArchiveEventHandler(FileSystemEventHandler):
+    """Event handler for new files/directories in the monitored folder."""
+    def __init__(self, qbt_client, logger, processed_torrents, unpacker):
+        self.qbt_client = qbt_client
+        self.logger = logger
+        self.processed_torrents = processed_torrents
+        self.unpacker = unpacker
+
+    def on_created(self, event):
+        try:
+            time.sleep(1)
+            self.process_event(event)
+        except Exception as e:
+            self.logger.error(f"Error processing event for {event.src_path}: {e}", exc_info=True)
+
+    def process_event(self, event):
+        """Handles the logic for processing a new file or directory."""
+        time.sleep(5)
+        src_path = Path(event.src_path)
+        target_torrent, torrent_root_path = None, None
+
+        try:
+            for torrent in self.qbt_client.torrents():
+                content_path = Path(torrent["content_path"])
+                if src_path == content_path or src_path.parent.is_relative_to(content_path):
+                    target_torrent, torrent_root_path = torrent, content_path
+                    break
+        except Exception as e:
+            self.logger.error(f"Failed to get torrents from qBittorrent: {e}")
+            return
+
+        if not target_torrent:
+            self.logger.warning(f"Could not associate '{src_path.name}' with any torrent. Skipping.")
+            return
+
+        if target_torrent["progress"] < 1:
+            self.logger.info(f"Torrent '{target_torrent['name']}' is not yet complete ({target_torrent['progress'] * 100:.2f}%). Skipping.")
+            return
+
+        if target_torrent['hash'] in self.processed_torrents:
+            return
+
+        self.processed_torrents.add(target_torrent['hash'])
+        self.logger.info(f"Torrent '{target_torrent['name']}' is complete. Pausing and unpacking.")
+        
+        try:
+            self.qbt_client.pause_multiple([target_torrent['hash']])
+        except Exception as e:
+            self.logger.error(f"Failed to pause torrent '{target_torrent['name']}': {e}. Proceeding anyway.")
+
+        self.unpacker.unpack_archives(torrent_root_path)
+
+
+class MainApp(tk.Tk):
+    """The main GUI application class."""
+    def __init__(self):
+        super().__init__()
+        self.title("AutoUnpack")
+        
+        self.style = Style()
+
+        self.minsize(650, 450)
+
+        self.config = configparser.ConfigParser()
+        self.monitor_thread = None
+        self.processed_torrents = set()
+        self.extraction_history = []
+        self.log_window = None
+        self.log_text_widget = None
+        self._save_job = None
+
+        self.gui_queue = queue.Queue()
+        self.queue_handler = QueueHandler(self.gui_queue)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+        self.queue_handler.setFormatter(formatter)
+        self.logger = logging.getLogger()
+        self.logger.setLevel(logging.INFO)
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+        self.logger.addHandler(self.queue_handler)
+        
+        self._create_widgets()
+        self.load_config()
+        self._load_extraction_history()
+
+        if self.start_on_launch.get():
+            self.after(500, self.start_monitoring)
+
+        self.after(100, self._poll_gui_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _create_widgets(self):
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill="both", expand=True)
+
+        settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding=(10, 10, 10, 5))
+        settings_frame.pack(fill="x")
+
+        qbit_frame = ttk.LabelFrame(settings_frame, text="qBittorrent", padding=(10, 5))
+        qbit_frame.grid(row=0, column=0, padx=(0, 5), pady=5, sticky="nsew")
+
+        self.qbt_host_var = tk.StringVar()
+        self.qbt_host_var.trace_add("write", self._schedule_save)
+        ttk.Label(qbit_frame, text="Host:").grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self.qbt_host = tk.Entry(qbit_frame, textvariable=self.qbt_host_var, background=self.style.COLOR_MEDIUM_GRAY, foreground=self.style.COLOR_WHITE, insertbackground=self.style.COLOR_WHITE, borderwidth=2, relief="flat")
+        self.qbt_host.grid(row=0, column=1, sticky="ew", pady=(0, 2))
+
+        self.qbt_port_var = tk.StringVar()
+        self.qbt_port_var.trace_add("write", self._schedule_save)
+        ttk.Label(qbit_frame, text="Port:").grid(row=1, column=0, sticky="w", pady=(0, 2))
+        self.qbt_port = tk.Entry(qbit_frame, textvariable=self.qbt_port_var, background=self.style.COLOR_MEDIUM_GRAY, foreground=self.style.COLOR_WHITE, insertbackground=self.style.COLOR_WHITE, borderwidth=2, relief="flat")
+        self.qbt_port.grid(row=1, column=1, sticky="ew", pady=(0, 2))
+
+        self.qbt_user_var = tk.StringVar()
+        self.qbt_user_var.trace_add("write", self._schedule_save)
+        ttk.Label(qbit_frame, text="Username:").grid(row=2, column=0, sticky="w", pady=(0, 2))
+        self.qbt_user = tk.Entry(qbit_frame, textvariable=self.qbt_user_var, background=self.style.COLOR_MEDIUM_GRAY, foreground=self.style.COLOR_WHITE, insertbackground=self.style.COLOR_WHITE, borderwidth=2, relief="flat")
+        self.qbt_user.grid(row=2, column=1, sticky="ew", pady=(0, 2))
+
+        self.qbt_pass_var = tk.StringVar()
+        self.qbt_pass_var.trace_add("write", self._schedule_save)
+        ttk.Label(qbit_frame, text="Password:").grid(row=3, column=0, sticky="w", pady=(0, 2))
+        self.qbt_pass = tk.Entry(qbit_frame, show="*", textvariable=self.qbt_pass_var, background=self.style.COLOR_MEDIUM_GRAY, foreground=self.style.COLOR_WHITE, insertbackground=self.style.COLOR_WHITE, borderwidth=2, relief="flat")
+        self.qbt_pass.grid(row=3, column=1, sticky="ew")
+
+        folder_frame = ttk.LabelFrame(settings_frame, text="Folders", padding=(10, 5))
+        folder_frame.grid(row=0, column=1, padx=(5, 0), pady=5, sticky="nsew")
+        folder_frame.grid_columnconfigure(0, weight=1)
+
+        ttk.Label(folder_frame, text="Monitor Folder:").grid(row=0, column=0, sticky="w", columnspan=2)
+        self.monitor_path_var = tk.StringVar()
+        self.monitor_path_var.trace_add("write", self._schedule_save)
+        self.monitor_path = tk.Entry(folder_frame, width=30, textvariable=self.monitor_path_var, background=self.style.COLOR_MEDIUM_GRAY, foreground=self.style.COLOR_WHITE, insertbackground=self.style.COLOR_WHITE, borderwidth=2, relief="flat")
+        self.monitor_path.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ttk.Button(folder_frame, text="Browse...", command=self._browse_monitor_folder).grid(row=1, column=1, padx=(5,0), pady=(2, 0))
+
+        ttk.Label(folder_frame, text="7-Zip Path (7z.exe):").grid(row=2, column=0, sticky="w", columnspan=2, pady=(5,0))
+        self.seven_zip_path_var = tk.StringVar()
+        self.seven_zip_path_var.trace_add("write", self._schedule_save)
+        self.seven_zip_path = tk.Entry(folder_frame, width=30, textvariable=self.seven_zip_path_var, background=self.style.COLOR_MEDIUM_GRAY, foreground=self.style.COLOR_WHITE, insertbackground=self.style.COLOR_WHITE, borderwidth=2, relief="flat")
+        self.seven_zip_path.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+        ttk.Button(folder_frame, text="Browse...", command=self._browse_7zip).grid(row=3, column=1, padx=(5,0), pady=(2, 0))
+
+        options_frame = ttk.Frame(settings_frame)
+        options_frame.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5,0))
+
+        self.delete_on_success = tk.BooleanVar()
+        self.delete_on_success.trace_add("write", self._schedule_save)
+        ttk.Checkbutton(options_frame, text="Delete archives after successful extraction", variable=self.delete_on_success).pack(side="left", anchor="w")
+        
+        self.start_on_launch = tk.BooleanVar()
+        self.start_on_launch.trace_add("write", self._schedule_save)
+        ttk.Checkbutton(options_frame, text="Start monitoring on launch", variable=self.start_on_launch).pack(side="left", anchor="w", padx=10)
+
+        self.create_subfolder = tk.BooleanVar()
+        self.create_subfolder.trace_add("write", self._schedule_save)
+        ttk.Checkbutton(options_frame, text="Create subfolder for each extraction", variable=self.create_subfolder).pack(side="left", anchor="w")
+        
+        settings_frame.grid_columnconfigure(1, weight=1)
+
+        status_frame = ttk.LabelFrame(main_frame, text="Status", padding=(10, 5))
+        status_frame.pack(pady=10, fill="x")
+        self.status_label = ttk.Label(status_frame, text="Idle", anchor="w")
+        self.status_label.pack(fill="x")
+        self.progress_bar = ttk.Progressbar(status_frame, mode='indeterminate')
+        self.progress_bar.pack(fill='x', pady=5)
+        
+        history_frame = ttk.LabelFrame(main_frame, text="Extraction History", padding=(10, 5))
+        history_frame.pack(pady=(0, 10), fill="both", expand=True)
+        
+        history_list_frame = ttk.Frame(history_frame)
+        history_list_frame.pack(fill="both", expand=True, pady=5)
+        
+        scrollbar = ttk.Scrollbar(history_list_frame, orient="vertical")
+        
+        self.history_listbox = tk.Listbox(history_list_frame, 
+            yscrollcommand=scrollbar.set,
+            background=self.style.listbox_bg,
+            foreground=self.style.listbox_fg,
+            selectbackground=self.style.listbox_select_bg,
+            selectforeground=self.style.listbox_select_fg,
+            borderwidth=0,
+            highlightthickness=0,
+            activestyle="none"
+        )
+        self.history_listbox.pack(side="left", fill="both", expand=True)
+        self.history_listbox.bind("<<ListboxSelect>>", self._on_history_select)
+        scrollbar.config(command=self.history_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        
+        history_buttons_frame = ttk.Frame(history_frame)
+        history_buttons_frame.pack(fill="x")
+        
+        self.open_folder_button = ttk.Button(history_buttons_frame, text="Open Folder", command=self._open_extraction_folder, state="disabled")
+        self.open_folder_button.pack(side="left", pady=(0, 5))
+        
+        ttk.Button(history_buttons_frame, text="Clear History", command=self._clear_extraction_history).pack(side="right", pady=(0, 5))
+
+
+        controls_frame = ttk.Frame(main_frame)
+        controls_frame.pack(fill="x")
+        self.start_button = ttk.Button(controls_frame, text="Save & Start", command=self.start_monitoring)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(controls_frame, text="Stop", command=self.stop_monitoring, state="disabled")
+        self.stop_button.pack(side="left", padx=5)
+        self.scan_button = ttk.Button(controls_frame, text="Manual Scan", command=self.manual_scan)
+        self.scan_button.pack(side="left", padx=5)
+        self.logs_button = ttk.Button(controls_frame, text="View Logs", command=self.show_logs)
+        self.logs_button.pack(side="right")
+
+    def show_logs(self):
+        if self.log_window and self.log_window.winfo_exists():
+            self.log_window.lift()
+            return
+            
+        self.log_window = tk.Toplevel(self)
+        self.log_window.title("Activity Log")
+        self.log_window.geometry("800x500")
+        self.log_window.configure(background=self.style.COLOR_DARK_GRAY)
+        
+        log_frame = ttk.Frame(self.log_window, padding="10")
+        log_frame.pack(fill="both", expand=True)
+        
+        self.log_text_widget = scrolledtext.ScrolledText(log_frame, 
+            state="disabled", 
+            wrap=tk.WORD,
+            background=self.style.COLOR_MEDIUM_GRAY,
+            foreground=self.style.COLOR_LIGHT_GRAY
+        )
+        self.log_text_widget.pack(fill="both", expand=True)
+
+        self.log_window.protocol("WM_DELETE_WINDOW", self.hide_logs)
+
+    def hide_logs(self):
+        if self.log_window:
+            self.log_window.withdraw()
+
+    def _schedule_save(self, *args):
+        """Schedules a save operation, debouncing rapid changes."""
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(1000, self.save_config) # 1 second delay
+
+    def _browse_monitor_folder(self):
+        path = filedialog.askdirectory(title="Select Folder to Monitor")
+        if path:
+            self.monitor_path_var.set(path)
+            self.save_config()
+
+    def _browse_7zip(self):
+        path = filedialog.askopenfilename(title="Select 7z.exe", filetypes=(("Executable", "*.exe"), ("All files", "*.*")))
+        if path:
+            self.seven_zip_path_var.set(path)
+            self.save_config()
+
+    def _on_history_select(self, event=None):
+        """Enables or disables the 'Open Folder' button based on selection."""
+        if self.history_listbox.curselection():
+            self.open_folder_button.config(state="normal")
+        else:
+            self.open_folder_button.config(state="disabled")
+
+    def _open_extraction_folder(self):
+        """Opens the folder for the selected extraction history item."""
+        selected_indices = self.history_listbox.curselection()
+        if not selected_indices:
+            return
+        
+        selected_index = selected_indices[0]
+        try:
+            _, _, path_str = self.extraction_history[selected_index]
+            path = Path(path_str)
+            if path.exists():
+                os.startfile(path) # For Windows
+            else:
+                messagebox.showerror("Error", f"Folder not found:\n{path}")
+        except IndexError:
+            self.logger.error("History selection index is out of range.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open folder:\n{e}")
+
+    def _load_extraction_history(self):
+        self.extraction_history = []
+        if Path(EXTRACTION_LOG_FILE).exists():
+            with open(EXTRACTION_LOG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split(':', 2)
+                    if len(parts) < 3: continue
+                    
+                    status, name, path = parts
+                    self.extraction_history.append((status, name, path))
+
+                    self.history_listbox.insert(tk.END, name)
+                    idx = self.history_listbox.size() - 1
+                    if status == 'SUCCESS':
+                        self.history_listbox.itemconfig(idx, {'bg': self.style.success_color, 'fg': self.style.COLOR_DARK_GRAY})
+                    elif status == 'FAILURE':
+                        self.history_listbox.itemconfig(idx, {'bg': self.style.error_color, 'fg': self.style.COLOR_DARK_GRAY})
+
+    def _clear_extraction_history(self):
+        if messagebox.askyesno("Clear History", "Are you sure you want to permanently delete the extraction history?"):
+            self.history_listbox.delete(0, tk.END)
+            self.extraction_history = []
+            if Path(EXTRACTION_LOG_FILE).exists():
+                os.remove(EXTRACTION_LOG_FILE)
+            self.logger.info("Extraction history cleared.")
+            self._on_history_select()
+
+    def load_config(self):
+        if not Path(CONFIG_FILE).exists():
+            self.logger.info("No config file found. Please enter your settings.")
+            return
+
+        self.config.read(CONFIG_FILE)
+        if 'qBittorrent' in self.config:
+            qbt = self.config['qBittorrent']
+            self.qbt_host_var.set(qbt.get('host', 'localhost'))
+            self.qbt_port_var.set(qbt.get('port', '8080'))
+            self.qbt_user_var.set(qbt.get('username', ''))
+            self.qbt_pass_var.set(qbt.get('password', ''))
+
+        if 'Folders' in self.config:
+            folders = self.config['Folders']
+            self.monitor_path_var.set(folders.get('monitor_path', ''))
+            self.seven_zip_path_var.set(folders.get('seven_zip_path', ''))
+
+        if 'General' in self.config:
+            general_config = self.config['General']
+            self.delete_on_success.set(general_config.getboolean('delete_on_success', fallback=False))
+            self.start_on_launch.set(general_config.getboolean('start_on_launch', fallback=False))
+            self.create_subfolder.set(general_config.getboolean('create_subfolder', fallback=True))
+            
+        self.logger.info("Configuration loaded.")
+
+    def save_config(self):
+        self.config['qBittorrent'] = {'host': self.qbt_host_var.get(), 'port': self.qbt_port_var.get(), 'username': self.qbt_user_var.get(), 'password': self.qbt_pass_var.get()}
+        self.config['Folders'] = {'monitor_path': self.monitor_path_var.get(), 'seven_zip_path': self.seven_zip_path_var.get()}
+        self.config['General'] = {
+            'delete_on_success': str(self.delete_on_success.get()),
+            'start_on_launch': str(self.start_on_launch.get()),
+            'create_subfolder': str(self.create_subfolder.get())
+            }
+        with open(CONFIG_FILE, 'w') as configfile:
+            self.config.write(configfile)
+        self.logger.info("Configuration saved.")
+        return True
+
+    def start_monitoring(self):
+        if not all([self.qbt_host_var.get(), self.qbt_port_var.get(), self.monitor_path_var.get(), self.seven_zip_path_var.get()]):
+            messagebox.showerror("Error", "Please fill in all required fields.")
+            return
+
+        if not self.save_config():
+            return
+
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.scan_button.config(state="disabled")
+        self.monitor_thread = UnpackMonitorThread(self.config, self.logger, self.processed_torrents, self.gui_queue)
+        self.monitor_thread.start()
+
+    def stop_monitoring(self):
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.stop()
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        self.scan_button.config(state="normal")
+        self.status_label.config(text="Idle")
+
+    def manual_scan(self):
+        """Starts a manual scan in a background thread."""
+        self.scan_button.config(state="disabled")
+        threading.Thread(target=self._run_manual_scan, daemon=True).start()
+
+    def _run_manual_scan(self):
+        """The actual logic for the manual scan."""
+        try:
+            self.gui_queue.put(('status', "Manual scan: Connecting..."))
+            host, port, username, password = self.qbt_host_var.get(), self.qbt_port_var.get(), self.qbt_user_var.get(), self.qbt_pass_var.get()
+            monitor_path_str, seven_zip_path = self.monitor_path_var.get(), self.seven_zip_path_var.get()
+            delete_on_success = self.delete_on_success.get()
+            create_subfolder = self.create_subfolder.get()
+
+            if not all([host, port, monitor_path_str, seven_zip_path]):
+                self.logger.error("Cannot run manual scan: settings are incomplete.")
+                self.gui_queue.put(('status', "Error: Settings incomplete"))
+                return
+
+            monitor_path = Path(monitor_path_str)
+            qbt_client = Client(f"http://{host}:{port}/")
+            qbt_client.login(username=username, password=password)
+            self.logger.info("Manual scan: Connected to qBittorrent.")
+
+            unpacker = Unpacker(seven_zip_path, delete_on_success, self.logger, self.gui_queue, create_subfolder)
+            self.gui_queue.put(('status', "Manual scan: Checking torrents..."))
+
+            torrents_to_process = []
+            for torrent in qbt_client.torrents():
+                content_path = Path(torrent["content_path"])
+                if torrent["progress"] == 1 and str(content_path.resolve()).startswith(str(monitor_path.resolve())) and torrent['hash'] not in self.processed_torrents:
+                    torrents_to_process.append(torrent)
+            
+            if not torrents_to_process:
+                self.logger.info("Manual scan complete. No new archives found.")
+                self.gui_queue.put(('status', "Manual scan complete. No new archives found."))
+                return
+
+            self.logger.info(f"Manual scan found {len(torrents_to_process)} torrent(s) to process.")
+            for i, torrent in enumerate(torrents_to_process):
+                content_path = Path(torrent["content_path"])
+                self.gui_queue.put(('status', f"Scanning ({i+1}/{len(torrents_to_process)}): {torrent['name']}"))
+                self.processed_torrents.add(torrent['hash'])
+                
+                try:
+                    qbt_client.pause_multiple([torrent['hash']])
+                except Exception as e:
+                    self.logger.error(f"Failed to pause torrent '{torrent['name']}': {e}. Proceeding anyway.")
+                
+                unpacker.unpack_archives(content_path)
+            
+            self.logger.info("Manual scan complete.")
+            self.gui_queue.put(('status', "Manual scan complete."))
+
+        except Exception as e:
+            self.logger.error(f"An error occurred during manual scan: {e}", exc_info=True)
+            self.gui_queue.put(('status', "Error during manual scan."))
+        finally:
+            self.after(0, lambda: self.scan_button.config(state="normal"))
+
+    def _poll_gui_queue(self):
+        while True:
+            try:
+                message_type, data = self.gui_queue.get(block=False)
+            except queue.Empty:
+                break
+            else:
+                if message_type == 'log':
+                    if self.log_window and self.log_window.winfo_exists() and self.log_text_widget:
+                        self.log_text_widget.config(state="normal")
+                        self.log_text_widget.insert(tk.END, data + '\n')
+                        self.log_text_widget.config(state="disabled")
+                        self.log_text_widget.see(tk.END)
+                elif message_type == 'status':
+                    self.status_label.config(text=data)
+                elif message_type == 'progress':
+                    if data == 'start':
+                        self.progress_bar.start(10)
+                    elif data == 'stop':
+                        self.progress_bar.stop()
+                elif message_type == 'extraction_success':
+                    name, path = data
+                    self.extraction_history.append(('SUCCESS', name, path))
+                    self.history_listbox.insert(tk.END, name)
+                    self.history_listbox.itemconfig(self.history_listbox.size() - 1, {'bg': self.style.success_color, 'fg': self.style.COLOR_DARK_GRAY})
+                elif message_type == 'extraction_failure':
+                    name, path = data
+                    self.extraction_history.append(('FAILURE', name, path))
+                    self.history_listbox.insert(tk.END, name)
+                    self.history_listbox.itemconfig(self.history_listbox.size() - 1, {'bg': self.style.error_color, 'fg': self.style.COLOR_DARK_GRAY})
+                        
+        self.after(100, self._poll_gui_queue)
+
+    def _on_closing(self):
+        # Always save the latest settings on exit, cancelling any pending save
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self.save_config()
+        
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            if messagebox.askokcancel("Quit", "Monitoring is active. Do you want to stop and quit?"):
+                self.stop_monitoring()
+                self.destroy()
+        else:
+            self.destroy()
+
+
+if __name__ == "__main__":
+    app = MainApp()
+    app.mainloop() 
