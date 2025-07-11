@@ -4,6 +4,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -11,12 +12,20 @@ from collections import defaultdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import pystray
+from PIL import Image, ImageDraw, ImageFont
 from qbittorrent import Client
 # Watchdog is no longer needed
 # from watchdog.events import FileSystemEventHandler
 # from watchdog.observers import Observer
 
 from style import Style
+
+# --- Platform Specific Imports ---
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    import win32com.client
+
 
 # --- Configuration ---
 CONFIG_FILE = "config.ini"
@@ -252,6 +261,7 @@ class MainApp(tk.Tk):
         self.log_window = None
         self.log_text_widget = None
         self._save_job = None
+        self.tray_icon = None
 
         self.gui_queue = queue.Queue()
         self.queue_handler = QueueHandler(self.gui_queue)
@@ -266,12 +276,16 @@ class MainApp(tk.Tk):
         self._create_widgets()
         self.load_config()
         self._load_extraction_history()
+        self._create_icon_file_if_needed()
+        self._setup_window_icon()
+        self._setup_system_tray()
 
         if self.start_on_launch.get():
             self.after(500, self.start_monitoring)
 
         self.after(100, self._poll_gui_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self.bind("<Unmap>", self._on_minimize)
 
     def _create_widgets(self):
         main_frame = ttk.Frame(self, padding="10")
@@ -339,6 +353,11 @@ class MainApp(tk.Tk):
         self.create_subfolder = tk.BooleanVar()
         self.create_subfolder.trace_add("write", self._schedule_save)
         ttk.Checkbutton(options_frame, text="Create subfolder for each extraction", variable=self.create_subfolder).pack(side="left", anchor="w")
+
+        self.run_on_startup = tk.BooleanVar()
+        if IS_WINDOWS:
+            self.run_on_startup.trace_add("write", self._update_startup_setting)
+            ttk.Checkbutton(options_frame, text="Run on Windows startup", variable=self.run_on_startup).pack(side="left", anchor="w", padx=10)
         
         settings_frame.grid_columnconfigure(1, weight=1)
 
@@ -379,6 +398,7 @@ class MainApp(tk.Tk):
         self.open_folder_button.pack(side="left", pady=(0, 5))
         
         ttk.Button(history_buttons_frame, text="Clear History", command=self._clear_extraction_history).pack(side="right", pady=(0, 5))
+        ttk.Button(history_buttons_frame, text="Clear & Delete All Data", command=self._delete_all_data, style="Danger.TButton").pack(side="right", padx=5, pady=(0, 5))
 
 
         controls_frame = ttk.Frame(main_frame)
@@ -436,6 +456,43 @@ class MainApp(tk.Tk):
             self.seven_zip_path_var.set(path)
             self.save_config()
 
+    def _update_startup_setting(self, *args):
+        if not IS_WINDOWS:
+            return
+        
+        try:
+            startup_path = self._get_startup_folder()
+            shortcut_path = os.path.join(startup_path, "AutoUnpack.lnk")
+
+            if self.run_on_startup.get():
+                self.logger.info("Adding application to Windows startup.")
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shortcut = shell.CreateShortCut(shortcut_path)
+                
+                # Use pythonw.exe to run without a console window
+                python_exe_path = sys.executable.replace("python.exe", "pythonw.exe")
+                script_path = os.path.abspath(__file__)
+                
+                shortcut.Targetpath = python_exe_path
+                shortcut.Arguments = f'"{script_path}"'
+                shortcut.WorkingDirectory = os.path.dirname(script_path)
+                shortcut.IconLocation = python_exe_path
+                shortcut.save()
+            else:
+                self.logger.info("Removing application from Windows startup.")
+                if os.path.exists(shortcut_path):
+                    os.remove(shortcut_path)
+
+        except Exception as e:
+            self.logger.error(f"Failed to update startup setting: {e}", exc_info=True)
+            messagebox.showerror("Startup Error", f"Failed to update Windows startup setting:\n{e}")
+
+    def _get_startup_folder(self):
+        if IS_WINDOWS:
+            shell = win32com.client.Dispatch("WScript.Shell")
+            return shell.SpecialFolders("Startup")
+        return None
+
     def _on_history_select(self, event=None):
         """Enables or disables the 'Open Folder' button based on selection."""
         if self.history_listbox.curselection():
@@ -485,13 +542,70 @@ class MainApp(tk.Tk):
                         self.history_listbox.itemconfig(idx, {'bg': self.style.error_color, 'fg': self.style.COLOR_DARK_GRAY})
 
     def _clear_extraction_history(self):
-        if messagebox.askyesno("Clear History", "Are you sure you want to permanently delete the extraction history?"):
+        if messagebox.askyesno("Clear History", "Are you sure you want to permanently delete the extraction history log?\n\n(This will not delete any extracted files.)"):
             self.history_listbox.delete(0, tk.END)
             self.extraction_history = []
             if Path(EXTRACTION_LOG_FILE).exists():
                 os.remove(EXTRACTION_LOG_FILE)
-            self.logger.info("Extraction history cleared.")
+            self.logger.info("Extraction history log cleared.")
             self._on_history_select()
+
+    def _delete_all_data(self):
+        """Deletes the history log AND all extracted folders after confirmation."""
+        import tkinter.simpledialog
+        
+        warning_msg = (
+            "This is a destructive action that cannot be undone.\n\n"
+            "It will permanently delete:\n"
+            "  1. All entries from the Extraction History.\n"
+            "  2. All corresponding extracted folders and their contents from your disk.\n\n"
+            "To confirm, please type 'DELETE!' in the box below."
+        )
+
+        response = tkinter.simpledialog.askstring("Confirm Deletion", warning_msg, parent=self)
+
+        if response != "DELETE!":
+            messagebox.showinfo("Cancelled", "Deletion cancelled. No files were changed.")
+            return
+
+        self.logger.info("Starting deletion of all extracted data...")
+        
+        deleted_count = 0
+        failed_count = 0
+        
+        # Make a copy for safe iteration while modifying the original
+        history_to_delete = list(self.extraction_history)
+
+        for _, _, path_str in history_to_delete:
+            try:
+                path = Path(path_str)
+                if path.is_dir():
+                    import shutil
+                    shutil.rmtree(path)
+                    self.logger.info(f"Deleted folder: {path}")
+                    deleted_count += 1
+                elif path.exists():
+                    # Handle cases where the path might be a file (less likely)
+                    os.remove(path)
+                    self.logger.info(f"Deleted file: {path}")
+                    deleted_count += 1
+            except Exception as e:
+                self.logger.error(f"Failed to delete '{path_str}': {e}")
+                failed_count += 1
+        
+        # Clear the in-app history and log file
+        self.history_listbox.delete(0, tk.END)
+        self.extraction_history = []
+        if Path(EXTRACTION_LOG_FILE).exists():
+            os.remove(EXTRACTION_LOG_FILE)
+        
+        self.logger.info("All data deletion process complete.")
+        
+        summary_msg = f"Deletion complete.\n\nSuccessfully deleted: {deleted_count} items.\nFailed to delete: {failed_count} items."
+        if failed_count > 0:
+            summary_msg += "\n\nCheck the logs for more details on failures."
+        messagebox.showinfo("Deletion Complete", summary_msg)
+        self._on_history_select()
 
     def load_config(self):
         if not Path(CONFIG_FILE).exists():
@@ -516,6 +630,8 @@ class MainApp(tk.Tk):
             self.delete_on_success.set(general_config.getboolean('delete_on_success', fallback=False))
             self.start_on_launch.set(general_config.getboolean('start_on_launch', fallback=False))
             self.create_subfolder.set(general_config.getboolean('create_subfolder', fallback=True))
+            if IS_WINDOWS:
+                self.run_on_startup.set(general_config.getboolean('run_on_startup', fallback=False))
             
         self.logger.info("Configuration loaded.")
 
@@ -525,7 +641,8 @@ class MainApp(tk.Tk):
         self.config['General'] = {
             'delete_on_success': str(self.delete_on_success.get()),
             'start_on_launch': str(self.start_on_launch.get()),
-            'create_subfolder': str(self.create_subfolder.get())
+            'create_subfolder': str(self.create_subfolder.get()),
+            'run_on_startup': str(self.run_on_startup.get())
             }
         with open(CONFIG_FILE, 'w') as configfile:
             self.config.write(configfile)
@@ -589,18 +706,90 @@ class MainApp(tk.Tk):
                         
         self.after(100, self._poll_gui_queue)
 
-    def _on_closing(self):
-        # Always save the latest settings on exit, cancelling any pending save
-        if self._save_job:
-            self.after_cancel(self._save_job)
-        self.save_config()
+    def _create_icon_file_if_needed(self):
+        """Generates a permanent icon.ico file if one doesn't already exist."""
+        icon_path = "icon.ico"
+        if not os.path.exists(icon_path):
+            self.logger.info("Generating permanent icon file (icon.ico)...")
+            try:
+                width = 64
+                height = 64
+                background_color = (45, 45, 45)
+                text_color = (0, 191, 255)
+                image = Image.new('RGB', (width, height), background_color)
+                draw = ImageDraw.Draw(image)
+                try:
+                    font = ImageFont.truetype("arialbd.ttf", 42)
+                except IOError:
+                    font = ImageFont.load_default()
+                text = "AE"
+                try:
+                    text_bbox = draw.textbbox((0, 0), text, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                    position = ((width - text_width) / 2, (height - text_height) / 2 - 5)
+                    draw.text(position, text, font=font, fill=text_color)
+                except AttributeError:
+                    text_width, text_height = draw.textsize(text, font)
+                    position = ((width - text_width) / 2, (height - text_height) / 2)
+                    draw.text(position, text, font=font, fill=text_color)
+                
+                # Save as a multi-resolution ICO file
+                image.save(icon_path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+            except Exception as e:
+                self.logger.error(f"Failed to generate icon.ico: {e}", exc_info=True)
+
+    def _setup_window_icon(self):
+        """Creates and sets the main window icon from the permanent icon file."""
+        try:
+            icon_path = "icon.ico"
+            if os.path.exists(icon_path):
+                self.iconbitmap(icon_path)
+        except Exception as e:
+            self.logger.warning(f"Could not create or set window icon: {e}")
+
+    def _setup_system_tray(self):
+        """Sets up the system tray icon and its thread."""
+        try:
+            image = Image.open("icon.ico")
+            menu = (
+                pystray.MenuItem('Show', self._show_window, default=True),
+                pystray.MenuItem('Quit', self._quit_application)
+            )
+            self.tray_icon = pystray.Icon("AutoUnpack", image, "AutoUnpack", menu)
+            
+            # Run the icon in a separate thread
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception as e:
+            self.logger.error(f"Failed to create system tray icon: {e}", exc_info=True)
+
+    def _show_window(self):
+        """Shows the main application window."""
+        self.deiconify()
+        self.lift()
+
+    def _quit_application(self):
+        """Stops all processes and quits the application."""
+        if self.tray_icon:
+            self.tray_icon.stop()
         
         if self.monitor_thread and self.monitor_thread.is_alive():
-            if messagebox.askokcancel("Quit", "Monitoring is active. Do you want to stop and quit?"):
-                self.stop_monitoring()
-                self.destroy()
-        else:
-            self.destroy()
+            self.monitor_thread.stop()
+            self.monitor_thread.join(timeout=2) # Wait for thread to finish
+        
+        self.destroy()
+
+    def _on_minimize(self, event=None):
+        """Handles the window being minimized."""
+        # When the window state is 'iconic' (minimized), hide it.
+        if self.state() == 'iconic':
+            self.withdraw()
+
+    def _on_closing(self):
+        # Hide the window to the system tray instead of closing it
+        self.iconify()
+        self.withdraw()
+        self.tray_icon.notify("AutoUnpack is still running in the background.", "AutoUnpack")
 
 
 if __name__ == "__main__":
