@@ -111,7 +111,12 @@ class Unpacker:
             self.gui_queue.put(('status', f"Extracting: {archive_path.name}"))
             self.gui_queue.put(('progress', 'start'))
             self.logger.info(f"Extracting '{archive_path.name}'...")
-            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+            
+            # Use CREATE_NO_WINDOW on Windows to prevent any console window from appearing
+            if IS_WINDOWS:
+                subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
             
             self.logger.info(f"Successfully extracted '{archive_path.name}' to '{output_dir}'")
             self._log_extraction_event('SUCCESS', extraction_name, str(output_dir))
